@@ -490,6 +490,7 @@ def battery_pause_write_registers(model: Model | None, arm_fw: int | None = None
         return frozenset()
     return registers
 
+
 # Three-phase charge/discharge power rate (HR 1110 / 1108, the three-phase homes of HR 313/314).
 # Model-scoped, not in WRITE_SAFE_THREE_PHASE: the evidence (the async fork's TPH_*_LIMIT_AC and
 # GivTCP's writer) covers only the "3ph" models. GivTCP sends the All in One-HY to HR 313/314
