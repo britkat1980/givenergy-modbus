@@ -185,7 +185,7 @@ is rejected.
 | 1122 | `enable_force_discharge_3ph` | Enable force discharge |
 | 1123 | `enable_force_charge_3ph` | Enable force charge |
 
-### EMS plant-level scheduling (HR2040–2071)
+### EMS plant-level scheduling and car charging (HR2040–2073)
 
 | HR | Description | Notes |
 |---|---|---|
@@ -200,6 +200,7 @@ is rejected.
 | 2065–2067 | EMS export slot 2 | |
 | 2068–2070 | EMS export slot 3 | |
 | 2071 | EMS export power limit | Installer/DNO — not user-writable via app |
+| 2073 | EMS car charge boost | App: "EV Charger Fast Charge Amount"; 0–22000 W (bound from the async fork) |
 
 Use the `set_ems_*` helpers in `commands.py` rather than writing these directly.
 
