@@ -257,14 +257,14 @@ await client.one_shot_command(inverter.set_charge_slot(1, my_timeslot))
 
 The inverter knows its own `slot_map`, so slot setters don't need it threaded through. The base `_InverterCommands` mixin is composed onto both `SinglePhaseInverter` and `ThreePhaseInverter`; `_ThreePhaseCommands` (also composed onto `ThreePhaseInverter`) overrides the methods where single-phase and three-phase register addresses differ.
 
-Three-phase inverters additionally carry the `_ThreePhaseCommands` mixin (marker: ✦ three-phase), so `set_ac_charge`, `set_force_charge`, `set_force_discharge`, and `set_battery_reserve_soc` are reachable as instance methods on `ThreePhaseInverter` only:
+Three-phase inverters additionally carry the `_ThreePhaseCommands` mixin (marker: ✦ three-phase), so `set_ac_charge`, `set_force_charge`, `set_force_discharge`, `set_battery_reserve_soc`, `set_battery_charge_limit_ac` and `set_battery_discharge_limit_ac` (HR 1110 / 1108) are reachable as instance methods on `ThreePhaseInverter` only:
 
 ```python
 if isinstance(inverter, ThreePhaseInverter):
     await client.one_shot_command(inverter.set_force_charge(True))
 ```
 
-AC-limit commands (`set_battery_*_limit_ac`) and pause-mode commands (`set_battery_pause_mode`, `set_pause_slot_*`) remain on `commands.*` only rather than mixin methods, because which models accept them depends on model and firmware rather than inverter class (see [#75](https://github.com/dewet22/givenergy-modbus/issues/75)).
+Single-phase AC-limit commands (`set_battery_*_limit_ac`, HR 313/314) and pause-mode commands (`set_battery_pause_mode`, `set_pause_slot_*`) remain on `commands.*` only rather than mixin methods, because which models accept them depends on model and firmware rather than inverter class (see [#75](https://github.com/dewet22/givenergy-modbus/issues/75)).
 
 `one_shot_command()` gates the pause registers by model **and ARM firmware** — the first firmware-gated write. Pause mode (HR 318) is accepted on the All-in-One, on AC from ARM firmware 200, and on the Gen 1 hybrid on ARM firmware 187–499; the pause slot (HR 319/320) only on the All-in-One. A gated model whose firmware is unknown (`PlantCapabilities.arm_firmware_version` is `None`, e.g. capabilities restored from an older persisted payload) is rejected — re-run `detect()` to populate it. Other models reject these writes until there is evidence they accept them.
 
@@ -345,6 +345,7 @@ An unmarked row means the method is available on both inverter types. On `ThreeP
 | `set_enable_charge(enabled)` | Enable or disable charging | |
 | `set_battery_charge_limit(val)` | Charge power limit (0–100%; firmware expected to clamp per-model) | |
 | `set_battery_charge_limit_ac(val)` | AC charge power limit (1–100%; 0 errors on hardware) | ⛔ commands-only |
+| `set_battery_charge_limit_ac(val)` | Three-phase charge power rate (1–100%): HR 1110, the three-phase home of HR 313. Accepted on `HYBRID_3PH` / `AC_3PH` only | ✦ three-phase |
 | `set_shallow_charge(val)` | Set shallow charge threshold (deprecated — use `set_battery_soc_reserve`) | ⛔ commands-only |
 
 ### Discharging
@@ -354,6 +355,7 @@ An unmarked row means the method is available on both inverter types. On `ThreeP
 | `set_enable_discharge(enabled)` | Enable or disable discharging | |
 | `set_battery_discharge_limit(val)` | Discharge power limit (0–100%; firmware expected to clamp per-model) | |
 | `set_battery_discharge_limit_ac(val)` | AC discharge power limit (1–100%; 0 errors on hardware) | ⛔ commands-only |
+| `set_battery_discharge_limit_ac(val)` | Three-phase discharge power rate (1–100%): HR 1108, the three-phase home of HR 314. Accepted on `HYBRID_3PH` / `AC_3PH` only | ✦ three-phase |
 | `set_battery_soc_reserve(val)` | Minimum SOC to maintain (4–100%) | |
 | `set_battery_power_reserve(val)` | Battery power reserve (4–100%) | |
 

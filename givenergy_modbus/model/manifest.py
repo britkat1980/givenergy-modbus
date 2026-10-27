@@ -489,6 +489,13 @@ def battery_pause_write_registers(model: Model | None, arm_fw: int | None = None
         return frozenset()
     return registers
 
+# Three-phase charge/discharge power rate (HR 1110 / 1108, the three-phase homes of HR 313/314).
+# Model-scoped, not in WRITE_SAFE_THREE_PHASE: the evidence (the async fork's TPH_*_LIMIT_AC and
+# GivTCP's writer) covers only the "3ph" models. GivTCP sends the All in One-HY to HR 313/314
+# (giv_tcp#630/#645; it rejects 1000-range reads, giv_tcp#621) and refuses AIO_COMMERCIAL.
+WRITE_SAFE_THREE_PHASE_AC_LIMITS: frozenset[int] = frozenset({1108, 1110})
+_THREE_PHASE_AC_LIMIT_MODELS: frozenset[Model] = frozenset({Model.HYBRID_3PH, Model.AC_3PH})
+
 
 def write_safe_registers(model: Model | None, arm_fw: int | None = None) -> frozenset[int]:
     """Registers this model/firmware permits at the normal (non-installer) write tier.
@@ -529,4 +536,6 @@ def write_safe_registers(model: Model | None, arm_fw: int | None = None) -> froz
         safe = (safe - _LEGACY_CHARGE_SLOT_2) | WRITE_SAFE_EXTENDED_CHARGE_SLOT_2
     if ten_slot_single_phase or model in _SLOT_TARGET_THREE_PHASE_MODELS:
         safe = safe | WRITE_SAFE_SLOT_TARGETS
+    if model in _THREE_PHASE_AC_LIMIT_MODELS:
+        safe = safe | WRITE_SAFE_THREE_PHASE_AC_LIMITS
     return safe | battery_pause_write_registers(model, arm_fw)
