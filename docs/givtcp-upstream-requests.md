@@ -1,0 +1,575 @@
+> **Source:** copied from GivTCP `docs/upstream-givenergy-modbus-requests.md` on the `dev3` branch
+> (commit `912098e`, 2026-10-27). The requests below are GivTCP's text, unedited; the source has no
+> item 13. The [implementation plan](#implementation-plan) at the end maps them to PRs in this repo.
+
+# Draft requests for dewet22/givenergy-modbus
+
+Found while porting GivTCP to givenergy-modbus 2.12.0 (GivTCP `modbusv2` branch). Each section below is written to be posted as its own issue. The first three block features GivTCP users rely on today; the rest are smaller.
+
+Thanks again for the migration guide and the offer of help in britkat1980/giv_tcp#556. The port has gone smoothly apart from these points.
+
+---
+
+## 1. Allow battery pause mode / pause slot writes (HR 318–320), firmware-gated where needed
+
+**Problem**
+
+`one_shot_command()` rejects HR 318 (battery pause mode) and HR 319/320 (pause slot start/end) for every model. `WRITE_SAFE_SINGLE_PHASE` excludes them as "firmware-gated", but `write_safe_registers()` never adds them back: its docstring notes that `arm_fw` is accepted but no write capability is firmware-gated yet. `WRITE_SAFE_AC_CONFIG` doesn't include them either, even though `has_ac_config_block` describes 318–320 as part of that block on AC and All-in-One.
+
+So `set_battery_pause_mode()`, `set_pause_slot()`, `set_pause_slot_start()` and `set_pause_slot_end()` can't be used on any model:
+
+```
+InvalidPduState: HR(318) is not permitted for HYBRID_GEN1 inverter
+```
+
+The registers pass `WriteHoldingRegisterRequest.ensure_valid_state()`, since they're in `WRITE_SAFE_REGISTERS`. Only the per-model gate blocks them.
+
+**Evidence that these writes work**
+
+- On **Gen 1 hybrids with ARM firmware 187** (D0.187-A0.187, the firmware that added real-time control), GivTCP on the old async fork wrote pause mode successfully. Logs from two Gen 1 hybrids in britkat1980/giv_tcp#441:
+  `Setting Battery Pause Mode to PauseDischarge was a success` / `... to Disabled was a success`. That user drives it from Predbat daily.
+- The GivTCP maintainer's own Gen 1 hybrid (DTC 2003) is also on ARM firmware 187 and now fails with the error above.
+- The manifest already describes pause mode/slot as present on AC and All-in-One.
+
+**Request**
+
+1. Add 318–320 to the write-safe set for `AC` and `ALL_IN_ONE`, where the manifest already says they exist.
+2. Implement the firmware gate `write_safe_registers(model, arm_fw)` already allows for, so 318 (and 319/320 if confirmed) is allowed on single-phase hybrids at or above the first firmware that supports pause. 187 is confirmed on Gen 1; we don't know the exact first version for Gen 1, 2 or 3. GivTCP users can supply captures or test builds.
+3. Reading the state needs the same gate. `load_config()` only reads HR(300-359) for `has_ac_config_block` models (hybrids time out on the whole block, per #162). A narrow read such as HR(318, 3) for pause-capable hybrids would let consumers show the current pause mode.
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` adds HR 318-320 to the write-safe set for `ALL_IN_ONE`, `GATEWAY`, `HYBRID_GEN2`, `HYBRID_GEN3` and `HYBRID_HV_GEN3`, and HR 318 only for `HYBRID_GEN1` from ARM firmware 187 and `AC` from ARM firmware 200 (both confirmed by users; they have pause mode but no pause slot, and a Gen 1 on firmware 187 rejects writes to HR 319-320 and any read that includes them). Three-phase and EMS have no pause functions. After `load_config()` on the models without the AC config block it reads HR(318, 3), or HR(318, 1) where there's no pause slot. Remove it once the library supports this.
+
+Impact: Predbat uses pause mode to hold the battery (for example "freeze" and "hold for car"). Without these writes it can't do that on any GivEnergy inverter through GivTCP v2.
+
+---
+
+## 2. Per-slot charge/discharge target SOC writes for 10-slot inverters
+
+**Problem**
+
+On models with `has_extended_slots`, the library reads `charge_target_soc_1..10` (HR 242, 245, … stride 3) and `discharge_target_soc_1..10` (HR 272, 275, …). There's no command helper to write them, and the registers aren't in any write-safe set. `set_charge_target_soc()` (thanks for #243) covers only the single HR 116 target.
+
+GivTCP exposes per-slot targets as Home Assistant controls, and users automate them (Predbat, Octopus tariffs). On v2 these writes can only fail.
+
+**Request**
+
+- Helpers such as `set_charge_slot_target_soc(idx, soc)` / `set_discharge_slot_target_soc(idx, soc)`, resolving registers from the slot map the way `set_charge_slot_start(idx, …)` does.
+- Add those registers to the write-safe set for `has_extended_slots` models.
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` allows HR 242-269 / 272-299 (every third register) on `has_extended_slots` and `is_three_phase` models and writes them directly. On three-phase without `has_extended_slots` (`HYBRID_3PH`, `AC_3PH`) the library doesn't read HR(240, 60) at all, so slots 3-10 (which `THREE_PHASE_SLOTS` maps there) and their targets are never populated; the patch reads that block after `load_config()`. Remove it once the library supports this.
+
+---
+
+## 3. Charge/discharge rate writes on three-phase, HV Gen 3 and Gateway
+
+**Problem**
+
+- `ThreePhaseInverter` reads `battery_charge_limit_ac` at **HR 1110** and `battery_discharge_limit_ac` at **HR 1108** (the manifest notes three-phase remaps the AC-config controls there). Neither is in `WRITE_SAFE_THREE_PHASE` and there's no command helper, so a consumer can't set the charge/discharge rate on three-phase or HV Gen 3. The old async fork wrote these as `TPH_BATTERY_CHARGE_LIMIT_AC = 1110` / `TPH_BATTERY_DISCHARGE_LIMIT_AC = 1108`.
+- `set_battery_charge_limit_ac()` / `set_battery_discharge_limit_ac()` write HR 313/314, which are only write-safe with the AC-config block, so only on `AC` and `ALL_IN_ONE`.
+- On a **Gateway**, none of 313/314/1108/1110 are write-safe, and HR(300-359) isn't read. givenergy-modbus#373 settled the routing: the Gateway controls the AIOs behind it, and a capture showed GivTCP setting the AC charge/discharge limit (HR 313/314) on the Gateway at device 0x11. The library's own Gateway capture (`gateway_gaaa0014`) includes the whole HR(300-359) block, and a Gateway on firmware A0.014 answers live reads of it (HR 313/314 = 50/100). HR 111/112 read 0 on a Gateway, so the AC pair is its rate control. Requested upstream as givenergy-modbus#427.
+
+**Possible inconsistency to check**
+
+`ThreePhaseInverter.set_battery_soc_reserve()` correctly writes the three-phase shadow HR 1109. But on the same class, `set_battery_charge_limit()` writes HR 111, `set_battery_discharge_limit()` writes HR 112 and `set_battery_power_reserve()` writes HR 114, all single-phase registers. `WRITE_SAFE_THREE_PHASE` includes 1078, which the old fork used as `TPH_BATTERY_DISCHARGE_MIN_POWER_RESERVE`. Could you confirm whether those three helpers should route to three-phase registers on `ThreePhaseInverter`?
+
+**Request**
+
+- Three-phase helpers (or model-aware routing) for the AC charge/discharge limits at 1110/1108, added to `WRITE_SAFE_THREE_PHASE`.
+- Add `Model.GATEWAY` to `has_ac_config_block`, so `load_config()` reads HR(300-359) and HR 313/314 are write-safe (givenergy-modbus#427).
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` allows HR 1110 / 1108 on `is_three_phase` models and writes them directly, and allows HR 313 / 314 on `is_gateway` and reads HR(313, 2) after `load_config()` there. Remove it once the library supports this.
+
+---
+
+## 4. EMS model: identity and energy totals
+
+**Problem**
+
+The v2 `Ems` model exposes the EMS page registers (slots, targets, meter and inverter summaries) but none of the identity or energy fields the old fork provided. Accessing any of these on `plant.ems` raises `AttributeError`:
+
+`serial_number`, `model`, `firmware_version`, `system_time`, `status`, `p_inverter_active`, `grid_port_max_power_output`, `enable_plant_control` (possibly now `plant_enabled`), and the energy counters `e_grid_in_day`, `e_grid_in_total`, `e_grid_out_day`, `e_grid_out_total`, `e_generation_day`, `e_generation_total`, `e_pv_generation_total`, `e_inverter_in_total`, `e_inverter_out_today`, `e_ac_charge_today`. Only `e_active_generation_total` is present.
+
+Related GivTCP report: britkat1980/giv_tcp#538. The EMS "generation today" should come from the generation meter's `e_pv1_day`, not the inverter output.
+
+**Request**
+
+- Identity (serial, model, firmware, system time) for EMS from the HR(0-59) block every device answers.
+- The EMS energy counters, if they're in registers the library can read. An EMS owner has offered GivTCP remote access for testing (britkat1980/giv_tcp#499).
+
+---
+
+## 5. Consistent device identity and model across device types
+
+**Problem**
+
+- `GatewayV1`/`GatewayV2` and `Ems` have no `serial_number`, `model` or `arm_firmware_version`. GivTCP now reads identity from `plant.inverter` **before** setting capabilities (the HR 13–17 serial and HR 0 DTC), which works but relies on an unguaranteed detail.
+- `SinglePhaseInverter.model`, decoded from the raw DTC, disagrees with `detect()` for some families. DTC **0x8102** decodes as `Model.ALL_IN_ONE`, while `detect()` resolves the same unit as `HYBRID_HV_GEN3`. GivTCP users saw Gen 3 HV inverters labelled "All-in-One" (britkat1980/giv_tcp#565).
+
+**Request**
+
+- A common identity accessor, for example `Plant.identity` → serial, DTC, model and ARM/DSP firmware, valid for any device type and available after a single HR(0,60) read.
+- `model` on the device classes should match the model `detect()` resolves, or be documented as a coarse DTC-family decode.
+
+---
+
+## 6. Capability naming: `is_three_phase` vs "uses the 1000-range registers"
+
+`HYBRID_HV_GEN3` and `ALL_IN_ONE_HYBRID` report `is_three_phase = True` because they use the HR/IR 1000-range layout, and `select_inverter()` returns `ThreePhaseInverter` for them. Consumers naturally read `is_three_phase` as "electrically three-phase". GivTCP used it to choose three-phase UI and processing for single-phase HV Gen 3 units.
+
+**Update (2.13.0):** `HYBRID_HV_GEN3` is no longer in `is_three_phase` (hass#295), which resolves this for HV Gen 3. `ALL_IN_ONE_HYBRID` is still the one model where the flag means the register layout rather than the phase count.
+
+**Request:** consider a separate capability for the register layout (for example `uses_extended_register_map`), keeping `is_three_phase` for electrical phase count. At minimum, document the current meaning in the property docstring.
+
+---
+
+## 7. Total battery count across battery architectures
+
+`Plant.number_batteries` counts only LV battery addresses. HV stacks (`bcu_stacks` module counts), HV BMUs and AIO modules aren't included, so HV and three-phase systems report 0. You flagged this as a migration trap in giv_tcp#556. GivTCP now computes `max(lv, sum(bcu modules), aio modules, hv bmus)` itself.
+
+**Request:** a property that gives the total installed battery modules across architectures, for example `Plant.number_battery_modules`.
+
+---
+
+## 8. Public signal for batteries awaiting cold-start corroboration
+
+After a fresh connect, the first battery frame is held pending a corroborating read ("serving unknown meanwhile"), so `Battery.is_valid()` is `False` on the first poll. That's sensible, but consumers can't tell this state apart from a missing or failed battery without reading the private `Plant._splice_pending_baseline`. GivTCP now counts consecutive empty polls instead.
+
+**Request:** a public accessor, for example `Plant.battery_pending(address) -> bool` or a pending set, so consumers can show "waiting for confirmation" rather than an error.
+
+---
+
+## 9. `one_shot_command()` default timeout/retries
+
+`one_shot_command()` defaults to `timeout=1.5, retries=0`, tighter than `refresh()`'s `2.0 / 1`, which that docstring explains is tuned for a contended bus (#132). Writes were failing with a bare timeout on busy dongles, especially straight after a full `load_config()`. GivTCP now passes `timeout=3.0, retries=2`, relying on the library skipping a resend whose response already arrived.
+
+**Request:** consider matching the read defaults, or documenting that register writes are safe to retry and recommending a budget for contended buses.
+
+---
+
+## 10. EMS car charge boost write (HR 2073)
+
+**Problem**
+
+The v2 `Ems` model reads `car_charge_boost` at **HR 2073**, but there's no command helper to write it, and 2073 isn't in the EMS write-safe set (the EMS block allowlist stops at 2071). The old async fork wrote it with `set_car_charge_boost(val)`, valid 0–22000 W. GivTCP exposes Car Charge Boost as a Home Assistant control, so on v2 it can only fail.
+
+**Request**
+
+- A helper such as `Ems.set_car_charge_boost(watts)`, bounded 0–22000.
+- Add HR 2073 to the EMS write-safe set.
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` allows HR 2073 on EMS (adding it to both write-safe sets) and writes it directly, bounded 0-22000. Remove it once the library supports this.
+
+---
+
+## 11. Gateway write commands
+
+**Problem**
+
+`GatewayV1`/`GatewayV2` model only the IR 1600+ block and have no command methods, so calling a setter on `plant.gateway` raises `AttributeError` (for example `'GatewayV1' object has no attribute 'set_enable_discharge'`). GivTCP now sends Gateway writes through `plant.inverter`, which `select_inverter()` returns as a `SinglePhaseInverter` for `Model.GATEWAY`. Those writes are allowed only because `write_safe_registers(Model.GATEWAY)` falls through to `WRITE_SAFE_SINGLE_PHASE`: no Gateway-specific set exists. That matches what the old async fork did, where Gateway writes were plain single-phase HR writes, but it relies on a fallback rather than a supported path.
+
+**Request**
+
+- Confirm whether the single-phase write set is correct for the Gateway (mode, discharge enable, charge/discharge slots, targets, reserve), or define a Gateway write-safe set.
+- Either compose the command mixin onto `GatewayV1`/`GatewayV2`, or document `plant.inverter` as the write path for Gateways.
+- Rate control is covered in item 3, and identity in item 5.
+
+## 12. Gateway uses the 10-slot map
+
+**Problem**
+
+`Model.GATEWAY` is not in `_EXTENDED_SLOT_MODELS`, so the library treats the Gateway as a 2-slot device: it doesn't read HR 240-299, `slot_map` has two charge and two discharge slots, and writes to slots 3-10 and to the per-slot target SOCs are refused. GivEnergy's Modbus register map (v4.1.6, holding registers 240-479, "Ten stage charge and discharge time control") says the 10-slot block is available on every model except AC 3.0 and Gen 1/2. A Gateway capture holds the whole of HR 240-299 with sensible values (charge targets 100%, discharge targets 4%, in the documented layout).
+
+GivTCP patches `manifest._EXTENDED_SLOT_MODELS` to add `Model.GATEWAY` (see `GivTCP/modbus_patches.py`, #577). That gives the Gateway the 10-slot reads, slot map and slot writes, and lets GivTCP's per-slot target writes (item 2) through.
+
+**Request**
+
+- Add `Model.GATEWAY` to `_EXTENDED_SLOT_MODELS`, ideally confirmed with a write test on a real Gateway.
+
+## 14. HV BMU addresses for the second and later stacks
+
+**Problem**
+
+`_hv_bmu_candidates()` and `Plant.hv_stacks` give each stack's modules the next device addresses after the previous stack's (0x55-0x59 for the second of two 5-module stacks), each read at IR 60-119. The `hv_stacks` docstring notes this multi-stack layout isn't wire-confirmed (#265). On a two-stack HV Gen 3, the second stack's modules never answer there, so they never decode and the stack has no cell data (britkat1980/giv_tcp#611). The BCUs at 0x70/0x71 read fine.
+
+givenergy_modbus_async, which read both stacks on the same system, restarts the module addresses at 0x50 for every stack and picks the stack by register offset: module k of the stack at BCU 0x70 + n is device 0x50 + k, IR (60 + 120n)-(119 + 120n). That matches the address note in GivEnergy's HV BMU register map: register start = base + 120 × (BAMS_Addr − 0x90) × 32 + 120 × (BCU_Addr − 0x70).
+
+GivTCP patches `_refresh_banks` and `Plant.hv_stacks` to read and decode the second and later stacks' modules this way (see `GivTCP/modbus_patches.py`), keeping the library's address for any module that answered at detect.
+
+**Request**
+
+- Probe, poll and decode each stack's BMUs at 0x50 + k with a register base of 120 × the stack's BCU offset, and pass that base to `decode_cells_temps_serial()`.
+
+## 15. Enable the charge target without writing the target
+
+**Problem**
+
+There's no command that sets just `ENABLE_CHARGE_TARGET` (HR 20) to 1. `disable_charge_target()` clears it, but the only way to set it is `set_charge_target_enabled(target_soc)`, which also writes the enable-charge flag (HR 96, or AC charge, HR 1112, on three-phase) and the target. For a 100% target it clears HR 20 instead. So a consumer that only wants to turn the charge target on has to pass a target, and if the target it passes is stale (for example read before a new one was set) it overwrites the new one, or turns the charge target off. The old async fork had `enable_charge_target()`, which wrote only HR 20 = 1.
+
+**Request**
+
+- An `enable_charge_target()` command (and the three-phase equivalent, if it differs) that writes only HR 20 = 1, the counterpart of `disable_charge_target()`.
+
+**GivTCP workaround:** `enableChargeTarget()` in `GivTCP/write.py` writes HR 20 = 1 directly. It isn't in `GivTCP/modbus_patches.py`, which is for writes the library doesn't allow yet: HR 20 is already write-safe on every inverter model. Remove it once the library has the command.
+
+## 16. `close()` should finish cleaning up when `wait_closed()` fails
+
+**Problem**
+
+`Client.close()` only catches `ConnectionResetError` around `await self.writer.wait_closed()`. On a socket that has already died (for example after `network_producer: writer drain stalled`), `wait_closed()` can raise `TimeoutError: [Errno 110] Operation timed out` instead. `close()` then stops there: it never cancels `network_consumer_task` or cleans up the reader. The consumer task later fails with the same error, and as nothing awaits it, asyncio logs `Task exception was never retrieved` when the task is garbage collected, often long after the reconnect (britkat1980/giv_tcp#613).
+
+**Request**
+
+- Catch `OSError` (which includes `TimeoutError` and `ConnectionResetError`) around `wait_closed()`, or move the task and reader cleanup into a `finally`, so `close()` always cancels both network tasks.
+
+**GivTCP workaround:** `closeClient()` in `GivTCP/GivLUT.py` cancels both tasks after `close()`, whether or not it succeeded, and collects their exceptions. Remove it once `close()` does this.
+
+## 17. Charge slot 2 on 10-slot models is at HR 243/244
+
+**Problem**
+
+`EXTENDED_SLOTS` maps charge slot 2 to the legacy HR 31/32. A Gen 3 on 10-slot firmware rejects writes there with an error response (britkat1980/giv_tcp#619). givenergy_modbus_async read and wrote slot 2 at HR 243/244, next to its target SOC at HR 245, as do other GivEnergy clients. The library already decodes HR 243/244 as `charge_slot_2_x`.
+
+**Request**
+
+- Use `(243, 244)` for charge slot 2 in `EXTENDED_SLOTS`, and make them write-safe on 10-slot models.
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` does both. `read.py` reads slot 2 from `charge_slot_2_x` on 10-slot models.
+
+## 18. The All in One-HY (DTC 0x82xx) is single-phase
+
+**Problem**
+
+`CAPABILITIES["is_three_phase"]` includes `Model.ALL_IN_ONE_HYBRID`, so `select_inverter()` decodes it with `ThreePhaseInverter`, and it's polled and configured with the 1000-range banks (HR 1000-1124, IR 1000-1413). A user's All in One-HY units behind a Gateway reject those reads with error responses (britkat1980/giv_tcp#621), as the comment on `is_three_phase` says the residential All-in-One does. The register map (v4.1.6, device type codes) lists the All in One-HY as 6-12 kW units (0x8201-0x8204), and givenergy_modbus_async read every 0x8xxx device with the single-phase model.
+
+**Request**
+
+- Remove `Model.ALL_IN_ONE_HYBRID` from `CAPABILITIES["is_three_phase"]`, so it's decoded and polled single-phase like the All-in-One and HV Gen 3.
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` removes it from that set.
+
+## 19. Poll and model the EMS's IR 0-59
+
+**Problem**
+
+`_refresh_banks()` skips IR 0-59 (and 180-239) on an EMS, so nothing in that range is read. It holds the EMS's plant energy counters, which GivTCP 3.5 published from the old library's EMS model: inverter out/in totals (IR 6-7, 27-28), export/import totals (IR 21-22, 32-33) and today values (IR 25, 26), inverter in/out today (IR 35, 37), the generation meters' today (IR 17, 19) and total (IR 11-12), and Total Power (IR 52, signed W). IR 44 and 45-46, which the old library called generation, hold the same as inverter out (IR 37 and 6-7) on every EMS capture (britkat1980/giv_tcp#637). The dongle also relays the cloud's polls of this block, which are sometimes all zeros, and `Plant` caches them. The EMS model's one field there, `e_active_generation_total`, is IR 18 as a raw uint16, which reads like a power in W rather than an energy total.
+
+**Request**
+
+- Poll IR 0-59 on the EMS, and model the values above on `Ems` (all 0.1 kWh, the totals as uint32 high word first).
+- Don't commit an all-zero IR 0-59 reply on an EMS (its lifetime totals are never all 0).
+- Check `e_active_generation_total` (IR 18).
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` adds IR 0-59 to `REFRESH_IR_RANGES["is_ems"]`, and `read.py` decodes the values from the register cache (`EMS_IR_VALUES`), keeping the previous values when the block reads all zeros (`emsIRValues`).
+
+## 20. Read and allow the AC charge/discharge limit (HR 313/314) on Hybrid Gen 1, Gen 3 and All in One-HY
+
+**Problem**
+
+`set_battery_charge_limit_ac` / `set_battery_discharge_limit_ac` write HR 313/314, which are only write-safe on models with the AC config block (AC and All-in-One). The old library read HR 300-359 on every hybrid that answered it and wrote HR 313/314 on every single-phase model, and Hybrid Gen 1, Gen 3 and All in One-HY owners used them to set the AC charge and discharge rate (britkat1980/giv_tcp#630, #645). With the library, they aren't read on these models, so the AC rate entities aren't created.
+
+**Request**
+
+- Allow HR 313/314 writes on `Model.HYBRID_GEN1`, `Model.HYBRID_GEN3` and `Model.ALL_IN_ONE_HYBRID`, and read HR 313-314 there (a 2-register read, not the HR 300-359 block some DC hybrids time out on).
+
+**GivTCP workaround:** `GivTCP/modbus_patches.py` adds HR 313/314 to these models' write-safe registers (`AC_LIMIT_HYBRIDS`) and reads them after each `load_config()` (`EXTRA_READS`), and `write.acLimit()` sends their rate changes to them.
+
+## 21. Redact the WO dongle's LAN-config broadcast on 192.168.x.x networks, and don't pass undecodable frames through intact
+
+**Problem**
+
+A capture made with `Client.capture_frames()` (GivTCP's Share Device page) contained a WiFi dongle's full serial number and its IP address, netmask and gateway in plain text (britkat1980/giv_tcp#668, givenergy-modbus 2.13.0). They came from one 72-byte rx frame (header `5959 0001 0042 01 02`): the dongle's LAN-config broadcast, `<serial><pad><ip>,<netmask>,<gateway>
+
+
+
+` in ASCII.
+
+Two things combine:
+
+- **`LanConfigBroadcast` only matches some addresses.** It's recognised by the byte the transparent decoder reads as the function code being `'0'` (0x30). That byte is a character of the dongle's IP address text, so it's `'0'` for addresses like 10.x.x.x but not for 192.168.x.x, the most common home network: there it's `'9'`, and decoding fails with `NotImplementedError: TransparentResponse function #57 decoder`, then `InvalidFrame`.
+- **`FrameRedactor` passes undecodable frames through intact**, by design ("Any bytes that cannot be decoded ... are emitted intact"), with only a log warning. So any sensitive data in a frame the library can't decode reaches the capture.
+
+**Request**
+
+- Recognise the LAN-config broadcast by its content (a dongle serial followed by ASCII `ip,netmask,gateway`) rather than by the function-code byte, so it's decoded and redacted whatever the address.
+- Fail closed for captures: redact frames that can't be decoded rather than emit them intact. For example, zero the unit digits of anything shaped like a serial number (as for decoded frames) and the digits of anything shaped like an IPv4 address, which keeps the frame's length; or drop them, with a count in the log.
+
+**GivTCP workaround:** `GivTCP/capture.py` (`scrub()`) runs that second pass over every frame before Share Device writes it.
+
+---
+
+## Implementation plan
+
+Status checked on 2026-10-27 against dewet22 `main` @ `f7d8ff5` (2.13.0 + #417/#421), which
+hasn't moved since this plan was first drafted. Every request above is still open upstream.
+PR E is done on a local branch, not yet pushed.
+
+### Ground rules for every PR that touches writes
+
+- Add each new writable register to **both** gates: the model-aware `WRITE_SAFE_*` set in
+  `model/manifest.py` and `WRITE_SAFE_REGISTERS` in `pdu/write_registers.py`.
+- Add a regression test that calls `.encode()` on the new command, plus a per-model gate test
+  showing the register is allowed where intended and rejected everywhere else.
+- Validate command arguments in the helper (`_as_int`, explicit enum membership). Gate 2 only
+  checks that a value fits in uint16.
+- Update `docs/usage.md` in the same commit as any change to `commands.py`, and
+  `reference/writable-registers.md` when the allowlist changes.
+- Run the `register-safety-reviewer` agent on the diff before opening the PR.
+- Cite the evidence (capture, GivTCP log, issue link) in the PR body. If the evidence for a
+  model or firmware is thin, leave that model out and say so in the PR.
+- Use conventional commits and run `tox` before each commit.
+
+### PR sequence
+
+PR letters are stable identifiers, not the order to do them in. The **Order** column is the
+suggested order: bug fixes and read-only changes first, then write-path changes, with the ones
+other PRs depend on landing first.
+
+| Order | PR | What | Items | Kind | Risk | Depends on | Status |
+|---|---|---|---|---|---|---|---|
+| — | E | Firmware-gated writes + battery pause mode/slot | 1 | **write** | High | — | **Done locally** (`d83be93`) |
+| 1 | T | Redact LAN-config broadcast; captures fail closed | 21 | security | Medium | — | |
+| 2 | L | `close()` always cancels network tasks | 16 | fix | Low | — | |
+| 3 | M | `enable_charge_target()` | 15 | command (HR 20, already write-safe) | Low | — | |
+| 4 | A | Docs: `one_shot_command` retry budget | 9 (6 → see O) | docs / defaults | Low | — | |
+| 5 | B | `Plant.number_battery_modules` | 7 | read-only API | Low | — | |
+| 6 | C | Public battery-pending signal | 8 | read-only API | Low | — | |
+| 7 | D | Common device identity + model consistency | 5, 4 (identity) | read-only API | Medium | — | |
+| 8 | R | Poll and model EMS IR 0-59 (energy counters) | 19, 4 (energy) | read-only | Medium | — | |
+| 9 | Q | HV BMU addressing for second and later stacks | 14 | read-only | Medium | — | |
+| 10 | O | All in One-HY is single-phase | 18, 6 | model / polling / write routing | High | — | |
+| 11 | N | Charge slot 2 at HR 243/244 on 10-slot models | 17 | **write** | High | — | |
+| 12 | F | Per-slot charge/discharge target SOC writes | 2 | **write** + read | High | E, N | |
+| 13 | G | Three-phase AC charge/discharge limits (HR 1110/1108) | 3a | **write** | High | — | |
+| 14 | S | AC limit HR 313/314 on Gen 1, Gen 3, All in One-HY | 20 | **write** + read | High | O | |
+| 15 | H | Gateway: AC config block, write set, write path | 3b, 11 | **write** + read | High | D | |
+| 16 | P | Gateway uses the 10-slot map | 12 | **write** + read | High | H, N | |
+| 17 | I | EMS car charge boost (HR 2073) | 10 | **write** | Medium | — | |
+| 18 | J | Investigate three-phase HR 111/112/114 routing | 3 (inconsistency) | investigation → fix | Medium | G | |
+
+K (EMS energy counters) is folded into R: item 19 now supplies the register evidence that K was
+waiting for.
+
+#### E — firmware-gated writes; battery pause mode/slot (item 1) — done locally
+
+Branch `feat/firmware-gated-pause-writes`, commit `d83be93`. It adds
+`manifest.battery_pause_write_registers()`, unioned into `write_safe_registers()`:
+
+- `ALL_IN_ONE`: HR 318–320, not firmware-gated.
+- `AC` at ARM fw ≥ 200: HR 318 only.
+- `HYBRID_GEN1` at ARM fw 187–499: HR 318 only. The cap is there because `resolve_model()`
+  classes any "20" hybrid whose firmware isn't 3xx/8xx/9xx as GEN1.
+- Unknown firmware on a gated model is rejected. Every other model is rejected.
+- `set_battery_pause_mode()` now rejects values outside `BatteryPauseMode`.
+
+dev3's update to item 1 supports these choices: a Gen 1 on fw 187 rejects writes to HR
+319–320 and any read that includes them. GivTCP still enables 318–320 on `GATEWAY`,
+`HYBRID_GEN2`, `HYBRID_GEN3` and `HYBRID_HV_GEN3`, but the doc cites no evidence for those. They
+stay out until there is some.
+
+Follow-up, not in E: the pause-state read. Use HR(318, 1) on models that have pause mode but
+no pause slot (Gen 1, AC), and HR(318, 3) only where the slot is confirmed and the AC config
+block isn't already read. This needs a capture showing the read answers, because a timeout
+would fail `load_config()` on every call.
+
+#### T — `security:` capture redaction (item 21)
+
+Captures from `Client.capture_frames()` leaked a dongle serial and its LAN IP, netmask and
+gateway on 192.168.x.x networks (giv_tcp#668).
+
+- Recognise `LanConfigBroadcast` by its content (dongle serial followed by ASCII
+  `ip,netmask,gateway`) instead of by the byte the transparent decoder reads as the function
+  code. That byte is part of the IP address text, so it's only `'0'` for some addresses.
+- `FrameRedactor`: fail closed on undecodable frames. Zero serial-shaped and IPv4-shaped
+  digits so the frame length is unchanged, or drop the frame and log a count. Update the
+  "emitted intact" docstring and logging at `client.py` (the frame-redactor block, plus the
+  `capture_frames()` docstring).
+- Tests: a 192.168.x.x broadcast frame and a 10.x.x.x frame both come out redacted, and an
+  undecodable frame containing a serial and an IP comes out scrubbed.
+- Use the `security:` prefix so it lands under 🔒 Security in the changelog.
+
+#### L — `fix:` `close()` cleanup (item 16)
+
+- Catch `OSError` around `writer.wait_closed()` (it covers `ConnectionResetError` and
+  `TimeoutError`), and move the task cancellation and `reader.feed_eof()` into a `finally`, so
+  `close()` always cancels both network tasks.
+- Test: make `wait_closed()` raise `TimeoutError`, then assert the consumer task is cancelled
+  and `close()` returns.
+
+#### M — `feat: enable_charge_target()` (item 15)
+
+- Module function and `_InverterCommands` method that write only HR 20 = 1, the counterpart of
+  `disable_charge_target()`. HR 20 is already write-safe on every inverter model. Three-phase
+  uses the same enable flag (`disable_charge_target_3ph()` also writes HR 20 and differs
+  only in the target register), so one command covers both. No three-phase override needed.
+- Docs row in `usage.md`. Add an `.encode()` test.
+
+#### A — `docs:` write retry budget (item 9)
+
+- `one_shot_command()`: either raise the defaults to match `refresh()` (`2.0 / 1`) or document
+  that writes are safe to retry because the client skips a resend once the response has
+  arrived. Raising the defaults changes behaviour for hass and cli, so mark it `fix:` and add a
+  test proving that a retry after a late response doesn't double-write.
+- Item 6 (`is_three_phase` meaning) is resolved by O. If O lands, `is_three_phase` is
+  electrical phase count for every model, so only a docstring clarification is left.
+
+#### B — `feat: Plant.number_battery_modules` (item 7)
+
+- New property: `max(len(lv_battery_addresses), sum of bcu_stacks module counts, AIO modules,
+  HV BMUs)`, mirroring what GivTCP computes now.
+- Leave `number_batteries` unchanged, because it indexes `batteries` by LV address. Document the
+  difference in both docstrings.
+- Tests: use the existing LV, HV Gen 3, AIO and three-phase fixtures.
+
+#### C — `feat:` public cold-start pending signal (item 8)
+
+- `Plant.battery_pending(device_address) -> bool` (and/or `pending_battery_addresses`), backed
+  by `_splice_pending_baseline`.
+- Test: right after a fresh connect it reports pending, then clears once a corroborating read
+  arrives and when the baseline is dropped.
+
+#### D — `feat:` device identity across device types (items 5 and 4 identity)
+
+- `Plant.identity`: serial, DTC, resolved `Model`, ARM/DSP firmware, built from the HR(0-59)
+  block every device answers. It works for inverter, Gateway and EMS.
+- Add `serial_number`, `model` and firmware fields to `Ems` and `GatewayV1`/`V2`. Confirm
+  against the EMS and Gateway captures in `tests/`.
+- Model mismatch (DTC `0x8102` decodes as `ALL_IN_ONE` but `detect()` returns
+  `HYBRID_HV_GEN3`): make `SinglePhaseInverter.model` defer to the resolved capabilities when
+  they're present, otherwise document it as a coarse DTC-family decode. Check how hass uses it
+  first. If behaviour changes, use `Changelog: Changed` and file a hass issue.
+
+#### R — `feat:` EMS IR 0-59 (items 19 and 4 energy)
+
+- Add IR(0, 60) to `REFRESH_IR_RANGES["is_ems"]`.
+- Model on `Ems`, all in 0.1 kWh, uint32 totals high word first: inverter out/in totals (IR 6-7,
+  27-28), export/import totals (IR 21-22, 32-33) and today (IR 25, 26), inverter in/out today
+  (IR 35, 37), generation meters' today (IR 17, 19) and total (IR 11-12), and Total Power
+  (IR 52, signed W).
+- Don't commit an all-zero IR 0-59 reply on an EMS, because the dongle relays the cloud's polls
+  and those are sometimes all zeros. Follow the existing keep-last-good pattern in `Plant`.
+- `e_active_generation_total` (IR 18, raw uint16) looks like a power in W. Rename or deprecate
+  it with a `Changelog:` trailer.
+- IR 44/45-46 duplicate inverter out (IR 37, 6-7) on every capture (giv_tcp#637), so don't
+  expose them as "generation".
+- Evidence: EMS captures from giv_tcp#637. Add one as a fixture under `tests/`.
+
+#### Q — `fix:` HV BMU addressing for multi-stack systems (item 14)
+
+- Module k of the stack at BCU 0x70 + n is device 0x50 + k, read at IR (60 + 120n)-(119 + 120n).
+  This matches the async fork and GivEnergy's HV BMU register-map formula. Today
+  `_hv_bmu_candidates()` (`model/plant.py`) assigns consecutive addresses across stacks, which
+  isn't wire-confirmed (#265) and doesn't answer on a two-stack HV Gen 3 (giv_tcp#611).
+- Update the probe, `_refresh_banks`, `Plant.hv_stacks`, and the register base passed to
+  `decode_cells_temps_serial()`. Keep any module that answered at detect.
+- Read-only, but it changes topology. Check that `PlantTopologyMismatch` doesn't fire for
+  existing single-stack users whose persisted capabilities list BMU addresses.
+- Needs a two-stack capture as a fixture.
+
+#### O — `fix:` All in One-HY is single-phase (items 18, 6)
+
+- Remove `Model.ALL_IN_ONE_HYBRID` from `CAPABILITIES["is_three_phase"]`, as 2.13.0 did for
+  `HYBRID_HV_GEN3` (hass#295). Evidence: the units reject the 1000-range reads with error
+  responses (giv_tcp#621), and the register map lists 0x8201-0x8204 as 6-12 kW units.
+- Knock-on effects to handle and test, following the HV Gen 3 precedent:
+  - `select_inverter()` returns `SinglePhaseInverter`. Its slot map becomes `EXTENDED_SLOTS`
+    (it's in `_EXTENDED_SLOT_MODELS`), no longer `THREE_PHASE_SLOTS`.
+  - Polling drops HR 1000-1124 / IR 1000-1413.
+  - The write set moves from `WRITE_SAFE_THREE_PHASE` to `WRITE_SAFE_SINGLE_PHASE`. Add a fence
+    test like `test_write_safe_registers_hybrid_hv_gen3_re_addresses_the_same_slot_controls`.
+- This leaves `AIO_COMMERCIAL` as the only non-obvious member of `is_three_phase`. Check
+  whether it is electrically three-phase, then close out item 6 with a docstring.
+- File a hass issue, since entity sets change for AIO-HY users.
+
+#### N — `fix:` charge slot 2 at HR 243/244 on 10-slot models (item 17)
+
+- `EXTENDED_SLOTS` charge slot 2 → `(243, 244)`. Add 243/244 to `WRITE_SAFE_SINGLE_PHASE` only if
+  they can be scoped to `has_extended_slots` models. Otherwise add an extended-slot write set,
+  so 2-slot models can't write 243/244.
+- Evidence: a Gen 3 on 10-slot firmware returns an error response for writes at HR 31/32
+  (giv_tcp#619). The async fork and other clients use 243/244, and the library already
+  decodes 243/244 as `charge_slot_2_x`.
+- Check discharge slot 2 as well. `EXTENDED_SLOTS` keeps it at HR 44/45, and the 10-slot block
+  would put it at 273/274. No failure has been reported there, but ask in the PR.
+- Update `test_hybrid_hv_gen3_slot_map_addresses_are_all_write_safe` and the literal pins.
+- Interaction with E: none. Interaction with F: the slot-2 target is HR 245, adjacent.
+
+#### F — `feat:` per-slot target SOC writes (item 2)
+
+- Add the per-slot target register to `SlotMap`. Each slot is a (start, end, target) triple:
+  charge target n = HR 242+3(n-1), discharge target n = HR 272+3(n-1). Helpers
+  `set_charge_slot_target_soc(idx, soc)` / `set_discharge_slot_target_soc(idx, soc)` resolve
+  through `slot_map`, never hardcoded addresses.
+- Write-safe for `has_extended_slots` models. That includes `HYBRID_GEN3` only above fw 302, so
+  this PR reuses E's firmware-gate pattern.
+- Three-phase (`HYBRID_3PH`/`AC_3PH`): `THREE_PHASE_SLOTS` maps slots 3–10 to HR 246+, but
+  `load_config()` doesn't read HR(240, 60) there. Confirm that the targets are readable and
+  writable before adding them; that's a separate, capture-backed change.
+- Bounds: 0–100 (or 4–100 to match `set_charge_target_soc`).
+
+#### G — `feat:` three-phase AC charge/discharge limits (item 3a)
+
+- Add HR 1110 (`BATTERY_CHARGE_LIMIT_AC_3PH`) and 1108 (`BATTERY_DISCHARGE_LIMIT_AC_3PH`) to
+  `RegisterMap`, `WRITE_SAFE_THREE_PHASE` and the PDU allowlist.
+- `_ThreePhaseCommands.set_battery_charge_limit_ac` / `set_battery_discharge_limit_ac` route to
+  them. The old async fork wrote the same addresses, which is the evidence.
+- HV Gen 3 isn't three-phase since 2.13.0. Item 20 doesn't cover it, so leave it out.
+
+#### S — `feat:` AC limit HR 313/314 on Gen 1, Gen 3, All in One-HY (item 20)
+
+- Allow HR 313/314 on `HYBRID_GEN1`, `HYBRID_GEN3` and `ALL_IN_ONE_HYBRID`, with a narrow
+  HR(313, 2) read in `load_config()` instead of the HR(300-359) block hybrids time out on (#162).
+- Evidence: owners used these with the old library (giv_tcp#630, #645), and GivTCP's
+  `AC_LIMIT_HYBRIDS` workaround does this now.
+- Caution: the `has_ac_config_block` comment records that on the AIO the DC pair (HR 111/112)
+  is the operative battery-rate control (hass#281). Ask in the PR what 313/314 control on a
+  DC hybrid, so the docs say what the setting actually does.
+- Keep these grants separate from `WRITE_SAFE_AC_CONFIG` (as E did for pause), because these
+  models don't have the rest of the block.
+- `HYBRID_GEN3`: confirm whether this applies on both firmware lines (≤302 and the 10-slot
+  firmware).
+- Depends on O, which moves `ALL_IN_ONE_HYBRID` onto the single-phase write path.
+
+#### H — `feat:` Gateway AC config block, write set, write path (items 3b, 11)
+
+- Add `Model.GATEWAY` to `has_ac_config_block` (givenergy-modbus#427). The library's own
+  `gateway_gaaa0014` capture has the HR(300-359) block, which gives `load_config()` read
+  coverage and makes 313/314 write-safe. HR 111/112 read 0 on a Gateway, so the AC pair is its
+  rate control.
+- Define an explicit `WRITE_SAFE_GATEWAY` so the Gateway no longer falls through to
+  `WRITE_SAFE_SINGLE_PHASE`. Remove anything without Gateway evidence.
+- Write path: either compose the command mixin onto `GatewayV1`/`V2`, or document
+  `plant.inverter` as the supported Gateway write path. The docs option is smaller. Ask the
+  maintainer which.
+- Pause registers on the Gateway: GivTCP enables 318–320 there, but there's no evidence cited.
+  Leave them out.
+
+#### P — `feat:` Gateway uses the 10-slot map (item 12)
+
+- Add `Model.GATEWAY` to `_EXTENDED_SLOT_MODELS`. Evidence: register map v4.1.6 says the 10-slot
+  block is on every model except AC 3.0 and Gen 1/2, and a Gateway capture holds HR 240-299
+  with sensible values. Ideally get a write test on a real Gateway too.
+- Lands after H (the Gateway write set) and N (so the Gateway inherits the corrected slot 2).
+
+#### I — `feat: Ems.set_car_charge_boost` (item 10)
+
+- Add HR 2073 to `WRITE_SAFE_EMS` and the PDU allowlist. Add the helper on `_EmsCommands`,
+  bounded 0–22000 W (as in the old fork), validated with `_as_int`.
+
+#### J — investigate three-phase 111/112/114 routing
+
+- `_ThreePhaseCommands` inherits `set_battery_charge_limit` (HR 111),
+  `set_battery_discharge_limit` (HR 112) and `set_battery_power_reserve` (HR 114) from the
+  single-phase mixin, and those registers stay in `WRITE_SAFE_THREE_PHASE`. Use three-phase
+  captures to work out whether they are live on three-phase or shadowed (1078 for reserve?).
+- Outcome: either a `fix:` that reroutes or removes them from the three-phase set, or a
+  `docs:` change confirming the current behaviour. No speculative register changes.
+
+### Open questions for the maintainer (dewet22)
+
+1. E: are you happy for the first firmware-gated write to land with only Gen 1 (fw 187–499),
+   AC (fw ≥ 200) and the All-in-One, leaving Gen 2/3, HV Gen 3 and Gateway for later evidence?
+2. A: change the `one_shot_command()` defaults, or document only?
+3. H: mixin on the Gateway classes, or `plant.inverter` documented as the write path?
+4. N: should discharge slot 2 also move to HR 273/274 on 10-slot models?
+5. S: what do HR 313/314 control on a DC hybrid, given that HR 111/112 is the battery-rate
+   control there?

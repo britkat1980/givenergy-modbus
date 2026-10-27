@@ -12,6 +12,7 @@ exclude_docs: |
   post-v2.2-plan.md
   v2.1-roadmap.md
   post-v2-improvement-plan.md
+  givtcp-upstream-requests.md
 nav:
   - Home: index.md
   - Installation: installation.md
